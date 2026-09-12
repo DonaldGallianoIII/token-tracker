@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import socket
 import sys
 from collections import defaultdict
@@ -113,17 +114,29 @@ def truncate(text: str, limit: int) -> str:
 
 # ---------------------------------------------------------------- collect
 
+COMMAND_TAG_RE = re.compile(r"<command-name>(.*?)</command-name>(?:\s*<command-args>(.*?)</command-args>)?", re.S)
+
+
+def _plain_title(text: str) -> str:
+    """A headless slash-command session starts with command markup; turn it
+    into 'command args' so the dashboard shows what was run."""
+    match = COMMAND_TAG_RE.search(text or "")
+    if match:
+        return f"{match.group(1).strip()} {(match.group(2) or '').strip()}".strip()
+    return text
+
+
 def _first_user_text(record: dict) -> str | None:
     message = record.get("message") or {}
     if record.get("type") != "user" or record.get("isMeta"):
         return None
     content = message.get("content")
     if isinstance(content, str):
-        return content
+        return _plain_title(content)
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
-                return block.get("text")
+                return _plain_title(block.get("text"))
     return None
 
 
