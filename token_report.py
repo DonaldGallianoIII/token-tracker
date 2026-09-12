@@ -42,6 +42,7 @@ CONFIG = {
     "TopProjects": 12,
     "TopSessions": 40,
     "TopAgents": 80,
+    "MaxColumnLabels": 8,
     "TitleMaxChars": 70,
     # USD per million tokens. Source: platform.claude.com/docs/en/about-claude/pricing,
     # read 2026-09-12. Matched by prefix, first match wins, so keep specific ids first.
@@ -305,6 +306,25 @@ def legend(families: list[str]) -> str:
     return f'<div class="legend">{items}</div>'
 
 
+def selective_labels(days: list[str], totals: dict[str, float], slot: float) -> set[str]:
+    """Label the tallest columns and the last one, never two neighbors. Every
+    value stays reachable in the hover title and the tables."""
+    label_width = 58
+    if slot >= label_width:
+        return {d for d in days if totals[d] > 0}
+    candidates = sorted((d for d in days if totals[d] > 0), key=lambda d: -totals[d])[: CONFIG["MaxColumnLabels"]]
+    last = next((d for d in reversed(days) if totals[d] > 0), None)
+    if last:
+        candidates.append(last)
+    chosen: set[str] = set()
+    index = {d: i for i, d in enumerate(days)}
+    for day in sorted(set(candidates), key=lambda d: -totals[d]):
+        if any(abs(index[day] - index[other]) < 2 for other in chosen):
+            continue
+        chosen.add(day)
+    return chosen
+
+
 def stacked_columns(days: list[str], per_day: dict[str, dict[str, float]], families: list[str], unit: str, fmt) -> str:
     width, height = 900, 260
     left, right, top, bottom = 56, 12, 16, 40
@@ -313,6 +333,7 @@ def stacked_columns(days: list[str], per_day: dict[str, dict[str, float]], famil
     ymax = nice_ceiling(max(totals.values()) if totals else 1)
     slot = plot_w / max(len(days), 1)
     bar_w = min(24, slot * 0.7)
+    labelled = selective_labels(days, totals, slot)
     parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="{esc(unit)} per day, stacked by model family">']
     for i in range(5):
         y = top + plot_h - plot_h * i / 4
@@ -332,7 +353,7 @@ def stacked_columns(days: list[str], per_day: dict[str, dict[str, float]], famil
                 f'<rect x="{x:.1f}" y="{y_cursor + 2:.1f}" width="{bar_w:.1f}" height="{draw_h:.1f}" fill="{FAMILY_COLOR[fam]}">'
                 f'<title>{esc(day)} {esc(FAMILY_LABEL[fam])}: {esc(fmt(value))}</title></rect>'
             )
-        if totals[day] > 0:
+        if day in labelled:
             parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{y_cursor - 4:.1f}" class="cap" text-anchor="middle">{esc(fmt(totals[day]))}</text>')
         if idx % 3 == 0 or len(days) <= 14:
             parts.append(f'<text x="{x + bar_w / 2:.1f}" y="{height - 22}" class="tick" text-anchor="middle">{esc(day[5:])}</text>')
@@ -404,7 +425,7 @@ def render(rows: list[dict], metas: list[dict]) -> Path:
     now = datetime.now().astimezone()
     today = now.strftime("%Y-%m-%d")
     wk = week_start(now).strftime("%Y-%m-%d")
-    families_present = [f for f in FAMILY_ORDER if any(r["family"] == f for r in rows)]
+    families_present = [f for f in FAMILY_ORDER if any(r["family"] == f and (r["output"] or r["cost"]) for r in rows)]
 
     # This week tiles
     week_rows = [r for r in rows if r["date"] >= wk]
