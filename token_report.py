@@ -9,23 +9,32 @@ library.
   render    merge every snapshot in data/ (this machine and any others synced
             in) and write html/index.html, a static dashboard with inline SVG.
   all       collect, then render.
+  sample    write examples/sample-host.jsonl, a made-up snapshot from a
+            seeded generator, so the dashboard can be previewed with no
+            transcripts at all: python3 token_report.py render --data examples
 
-Usage: python3 token_report.py [collect|render|all] [--projects DIR]
+Usage: python3 token_report.py [collect|render|all|sample]
+                               [--projects DIR] [--data DIR] [--out DIR]
 
-@interacts  reads ~/.claude/projects/**.jsonl and data/*.jsonl; writes
-            data/<host>.jsonl and html/index.html only
-@deps       standard library only (json, datetime, pathlib, html, socket)
+@interacts  reads ~/.claude/projects/**.jsonl and <data>/*.jsonl; writes
+            data/<host>.jsonl, examples/sample-host.jsonl, <out>/index.html
+@deps       standard library only (json, datetime, pathlib, html, socket,
+            random, re)
 @complexity collect O(L), L transcript lines on the machine (about 1.5M for
-            436 MB); render O(R log R), R snapshot rows (thousands)
+            436 MB); render O(R log R), R snapshot rows (thousands);
+            sample O(D * S), D days (45) times sessions per day (under 6)
 @alloc      collect streams line by line and keeps one dict per
             (session, agent, model, day); render holds all rows in memory,
             a few MB. Nothing retained after write.
+@rng        sample only: random.Random(CONFIG["SampleSeed"]), one generator
+            for the whole run; collect and render draw no randomness
 """
 
 from __future__ import annotations
 
 import html
 import json
+import random
 import re
 import socket
 import sys
@@ -44,6 +53,9 @@ CONFIG = {
     "TopSessions": 40,
     "TopAgents": 80,
     "MaxColumnLabels": 8,
+    "SampleDir": Path(__file__).resolve().parent / "examples",
+    "SampleSeed": 20260912,
+    "SampleDays": 45,
     "TitleMaxChars": 70,
     # USD per million tokens. Source: platform.claude.com/docs/en/about-claude/pricing,
     # read 2026-09-12. Matched by prefix, first match wins, so keep specific ids first.
@@ -242,11 +254,90 @@ def collect(projects_dir: Path, host: str) -> Path:
     return out
 
 
+# ---------------------------------------------------------------- sample data
+
+SAMPLE_PROJECTS = ["storefront", "billing-api", "mobile-app", "data-pipeline", "docs-site", "infra"]
+SAMPLE_TITLES = [
+    "Fix checkout race on repeat clicks", "Migrate invoices to new schema", "Add offline mode to sync",
+    "Profile the nightly ETL", "Rewrite onboarding guide", "Terraform module for the queue",
+    "Review PR 412", "Flaky test in payments", "Design the export format", "Upgrade the linter",
+]
+SAMPLE_AGENTS = [
+    ("bugs-reviewer", "Review bugs in the diff"), ("integration-reviewer", "Trace callers of changed code"),
+    ("security-reviewer", "Check secrets and input handling"), ("test-strategist", "Propose tests for the change"),
+    ("explore", "Find every reader of the config"), ("fixer", "Apply the agreed fix"),
+]
+SAMPLE_MODELS = [("claude-opus-5", 0.62), ("claude-fable-5-1", 0.18), ("claude-sonnet-5", 0.14), ("claude-haiku-4-5", 0.06)]
+
+
+def _pick_model(rng: random.Random) -> str:
+    roll, acc = rng.random(), 0.0
+    for model, weight in SAMPLE_MODELS:
+        acc += weight
+        if roll <= acc:
+            return model
+    return SAMPLE_MODELS[0][0]
+
+
+def sample() -> Path:
+    """Deterministic fake snapshot for two hosts. Only the calendar anchor
+    (today) comes from the clock, so the demo looks current; every count
+    comes from the seeded generator."""
+    rng = random.Random(CONFIG["SampleSeed"])
+    today = datetime.now().astimezone().replace(hour=12, minute=0, second=0, microsecond=0)
+    rows = []
+    for host, sessions_per_day in (("studio-desktop", 2.2), ("field-laptop", 0.8)):
+        for back in range(CONFIG["SampleDays"] - 1, -1, -1):
+            day = today - timedelta(days=back)
+            if day.weekday() >= 5 and rng.random() < 0.6:
+                continue
+            for _ in range(max(0, int(rng.gauss(sessions_per_day, 1.0)))):
+                session_id = f"{host}-{day:%Y%m%d}-{rng.randrange(10**6):06d}"
+                project = rng.choice(SAMPLE_PROJECTS)
+                title = rng.choice(SAMPLE_TITLES)
+                start = day.replace(hour=rng.randrange(8, 20), minute=rng.randrange(60))
+                calls = rng.randrange(20, 400)
+                model = _pick_model(rng)
+                rows.append(_sample_row(host, session_id, None, {}, title, project, model, start, calls, rng))
+                for _ in range(rng.choice([0, 0, 1, 2, 4, 8])):
+                    agent_type, desc = rng.choice(SAMPLE_AGENTS)
+                    agent_model = rng.choice(["claude-opus-5", "claude-opus-5", "claude-sonnet-5"])
+                    rows.append(_sample_row(host, session_id, f"a{rng.randrange(16**8):08x}", {"agentType": agent_type, "description": desc, "model": agent_model.split("-")[1]},
+                                            title, project, agent_model, start + timedelta(minutes=rng.randrange(5, 90)), rng.randrange(8, 60), rng))
+    CONFIG["SampleDir"].mkdir(parents=True, exist_ok=True)
+    out = CONFIG["SampleDir"] / "sample-host.jsonl"
+    hosts = sorted({r["host"] for r in rows})
+    with out.open("w", encoding="utf-8") as handle:
+        for host in hosts:
+            mine = [r for r in rows if r["host"] == host]
+            handle.write(json.dumps({"_meta": True, "host": host, "version": CONFIG["SnapshotVersion"], "collected_at": today.isoformat(timespec="seconds"),
+                                     "sessions": len({r["session_id"] for r in mine if not r["agent_id"]}), "agents": len({r["agent_id"] for r in mine if r["agent_id"]}), "rows": len(mine), "sample": True}) + "\n")
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    print(f"wrote {len(rows)} sample rows for {len(hosts)} hosts into {out}")
+    return out
+
+
+def _sample_row(host, session_id, agent_id, meta, title, project, model, start, calls, rng) -> dict:
+    context = rng.randrange(20_000, 180_000)
+    return {
+        "host": host, "session_id": session_id, "agent_id": agent_id,
+        "agent_type": meta.get("agentType"), "agent_desc": meta.get("description"), "agent_model_alias": meta.get("model"),
+        "session_title": title, "project": project, "model": model, "date": start.strftime("%Y-%m-%d"),
+        "calls": calls, "tool_uses": int(calls * rng.uniform(0.5, 0.9)),
+        "input": int(calls * rng.uniform(5, 40)), "output": int(calls * rng.uniform(300, 1400)),
+        "cache_read": int(calls * context * rng.uniform(0.6, 1.0)),
+        "cache_w5m": int(calls * rng.uniform(800, 4000)), "cache_w1h": int(calls * rng.uniform(0, 1500)),
+        "first_ts": start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "last_ts": (start + timedelta(seconds=calls * rng.uniform(8, 40))).astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
 # ---------------------------------------------------------------- render: data shaping
 
-def load_snapshots() -> tuple[list[dict], list[dict]]:
+def load_snapshots(data_dir: Path) -> tuple[list[dict], list[dict]]:
     rows, metas = [], []
-    for path in sorted(CONFIG["DataDir"].glob("*.jsonl")):
+    for path in sorted(data_dir.glob("*.jsonl")):
         with path.open(encoding="utf-8") as handle:
             for line in handle:
                 try:
@@ -434,8 +525,9 @@ def table(headers: list[tuple[str, str]], rows: list[list[str]]) -> str:
     return f'<div class="tablewrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def render(rows: list[dict], metas: list[dict]) -> Path:
+def render(rows: list[dict], metas: list[dict], out_dir: Path) -> Path:
     now = datetime.now().astimezone()
+    is_sample = any(m.get("sample") for m in metas)
     today = now.strftime("%Y-%m-%d")
     wk = week_start(now).strftime("%Y-%m-%d")
     families_present = [f for f in FAMILY_ORDER if any(r["family"] == f and (r["output"] or r["cost"]) for r in rows)]
@@ -533,7 +625,7 @@ def render(rows: list[dict], metas: list[dict]) -> Path:
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Claude Token Tracker</title><style>{STYLE}</style></head><body><main>
 <h1>Claude Token Tracker</h1>
-<p class="sub">Rendered {esc(now.strftime('%Y-%m-%d %H:%M'))} from {len(metas)} machine snapshot(s). All-time est. cost at list price: <strong>{esc(fmt_usd(total_cost))}</strong>.</p>
+<p class="sub">Rendered {esc(now.strftime('%Y-%m-%d %H:%M'))} from {len(metas)} machine snapshot(s). All-time est. cost at list price: <strong>{esc(fmt_usd(total_cost))}</strong>.{' <strong>Sample data.</strong> Every number on this page is generated, not measured.' if is_sample else ''}</p>
 
 <section class="block"><h2>This week</h2><div class="tiles">{''.join(tiles)}</div></section>
 
@@ -556,8 +648,8 @@ def render(rows: list[dict], metas: list[dict]) -> Path:
 <h3>Rates, USD per million tokens</h3>{rate_table}
 </section>
 </main></body></html>"""
-    CONFIG["OutDir"].mkdir(parents=True, exist_ok=True)
-    out = CONFIG["OutDir"] / "index.html"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "index.html"
     out.write_text(page, encoding="utf-8")
     print(f"rendered {out} from {len(rows)} rows, {len(metas)} snapshot(s)")
     return out
@@ -565,23 +657,29 @@ def render(rows: list[dict], metas: list[dict]) -> Path:
 
 # ---------------------------------------------------------------- main
 
+def _flag(argv: list[str], name: str, default: Path) -> Path:
+    return Path(argv[argv.index(name) + 1]).expanduser() if name in argv else default
+
+
 def main(argv: list[str]) -> int:
-    command = argv[1] if len(argv) > 1 else "all"
-    projects = CONFIG["ProjectsDir"]
-    if "--projects" in argv:
-        projects = Path(argv[argv.index("--projects") + 1]).expanduser()
-    host = socket.gethostname()
-    if command in ("collect", "all"):
-        collect(projects, host)
-    if command in ("render", "all"):
-        rows, metas = load_snapshots()
-        if not rows:
-            print("no snapshots in data/; run collect first", file=sys.stderr)
-            return 1
-        render(rows, metas)
+    command = argv[1] if len(argv) > 1 and not argv[1].startswith("--") else "all"
+    projects = _flag(argv, "--projects", CONFIG["ProjectsDir"])
+    data_dir = _flag(argv, "--data", CONFIG["DataDir"])
+    out_dir = _flag(argv, "--out", CONFIG["OutDir"])
+    if command == "sample":
+        sample()
+        return 0
     if command not in ("collect", "render", "all"):
         print(__doc__)
         return 2
+    if command in ("collect", "all"):
+        collect(projects, socket.gethostname())
+    if command in ("render", "all"):
+        rows, metas = load_snapshots(data_dir)
+        if not rows:
+            print(f"no snapshots in {data_dir}; run collect first, or sample for a demo", file=sys.stderr)
+            return 1
+        render(rows, metas, out_dir)
     return 0
 
 
